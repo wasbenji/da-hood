@@ -1,25 +1,24 @@
 --[[
- 
-  
-           Da Hood // Was_Benji + Claude
+  oooooooooo              ooooo ooooo                          oooo
+  888     888  ooooooo    888   888    ooooooo  ooooooo    oooo888
+  888oooo88  888   888  888   888   888   888 888   888 888  888
+  888    888 888   888  888   888   888   888 888   888 888  888
+  o888ooo888   88ooo88  o888o o888o  88ooo88  888o888   888o888o
+
+
+      Thank you to debrainers on discord for letting me skid
 
   KEYBINDS:
     X  = toggle orbit
     V  = toggle auto stomp
     C  = toggle void
-    
-  FEATURES:
-    orbit       — random spherical orbit around target
-    auto stomp  — stomps target when KO'd, voids before stomp
-    carry       — carries after stomp (G key)
-    kill aura   — stomps any KO'd player within 30 studs
-    void        — teleports to random position in sky
-    health void — auto voids when HP drops below threshold
-    anti stomp  — LoadCharacter on KO = instant respawn, no stomp
-    speed hack  — writes 300 to WalkSpeed memory offset
-    fake lag    — rapid position spam then snap back
-    auto target — picks closest alive player automatically
-    group mon   — watches Stars / Verified / Staff groups
+
+  CONFIRMED FACTS:
+    armor node  = BodyEffects.Defense (NumberValue, 100=full 0=none)
+    CharacterAdded event = nil in Matcha (poll instead)
+    gun stores  = no ProximityPrompts, custom UI only
+    bounty post = 22 prompts in MAP/BountyPosters (not shops)
+    vehicle spw = prompts in VehicleSpawner/Sign (not shops)
 ]]
 
 local Players    = game:GetService("Players")
@@ -31,7 +30,7 @@ local KEY = { STOMP=0x45, CARRY=0x47 }
 local OFF_PRIMITIVE = 0x148
 local OFF_CFRAME    = 0xC0
 local OFF_HUM_VEL   = 0x18C
-local OFF_WALKSPEED = 0x1A8  -- confirmed: Da Hood base = 100
+local OFF_WALKSPEED = 0x1A8
 
 local STATE = {
     target=nil, targetName=nil,
@@ -40,6 +39,9 @@ local STATE = {
     stompActive=false,
     voidActive=false, voidStart=nil,
     antiStompOn=false,
+    autoArmorOn=false,
+    defenseNode=nil,
+    lastChar=nil,      -- track char changes without CharacterAdded
     healthSaveOn=true, healthThresh=30,
     autoStompOn=false, carryAfterStomp=true,
     killAuraOn=false,
@@ -55,6 +57,12 @@ local STATE = {
 local function safe(fn) local ok,e=pcall(fn); if not ok then print("[ERR]"..tostring(e)) end end
 local function getChar() return lp.Character end
 local function getHRP()  local c=getChar(); return c and c:FindFirstChild("HumanoidRootPart") end
+
+local function dist3(a,b)
+    if not a or not b then return 999 end
+    local dx=a.X-b.X; local dy=a.Y-b.Y; local dz=a.Z-b.Z
+    return math.sqrt(dx*dx+dy*dy+dz*dz)
+end
 
 local function getTorsoPos(plr)
     if not plr or not plr.Character then return nil end
@@ -95,7 +103,8 @@ local function isKOd()
 end
 local function shouldVoid()
     if STATE.target and hasSP(STATE.target) then return true end
-    if STATE.healthSaveOn and myHP()<STATE.healthThresh then return true end
+    local hp=myHP()
+    if STATE.healthSaveOn and hp and hp<STATE.healthThresh then return true end
     return false
 end
 local function resolveTarget()
@@ -269,29 +278,20 @@ local function startOrbit()
 end
 
 -- ================================================================
--- ANTI-STOMP
--- bind to RunService.Heartbeat so the
--- check runs every single rendered frame (~60x/sec), not on a
--- task.wait() scheduler. The instant KO is true, call
--- lp:LoadCharacter() which destroys the server-side ragdoll
--- immediately — nobody can stomp what isn't there.
--- task.wait()-based loops miss the window. Heartbeat doesn't.
+-- ANTI-STOMP (Heartbeat -- same method as debrainers
 -- ================================================================
-local antiStompConn = nil
-
+local antiStompConn=nil
 local function startAntiStomp()
     if antiStompConn then return end
-    local wasKO = false
-    antiStompConn = RunService.Heartbeat:Connect(function()
+    local wasKO=false
+    antiStompConn=RunService.Heartbeat:Connect(function()
         if not STATE.antiStompOn then return end
-        local ko = isKOd()
+        local ko=isKOd()
         if ko and not wasKO then
-            wasKO = true
+            wasKO=true
             notify("anti-stomp","defense",2)
-            -- Primary: force instant server-side respawn
-            local ok = pcall(function() lp:LoadCharacter() end)
+            local ok=pcall(function() lp:LoadCharacter() end)
             if not ok then
-                -- Fallback: destroy character parts (same end result)
                 safe(function()
                     local c=getChar(); if not c then return end
                     for _,v in ipairs(c:GetChildren()) do
@@ -301,17 +301,123 @@ local function startAntiStomp()
             end
         end
         if not ko then wasKO=false end
-        -- Always zero velocity while KO'd (belt-and-suspenders)
         if ko then zeroHumVel() end
     end)
 end
+startAntiStomp()
 
-local function stopAntiStomp()
-    if antiStompConn then antiStompConn:Disconnect(); antiStompConn=nil end
+-- ================================================================
+-- ARMOR -- BodyEffects.Defense (CONFIRMED from probe)
+--
+-- CharacterAdded:Connect() = nil in Matcha (same as InputBegan).
+-- Instead we poll: if lp.Character changed, re-resolve node.
+-- Defense = 100 (full armor), 0 = no armor.
+-- ================================================================
+local function resolveDefenseNode()
+    local c=getChar(); if not c then return end
+    local be=c:FindFirstChild("BodyEffects"); if not be then return end
+    local node=be:FindFirstChild("Defense")
+    if node then
+        STATE.defenseNode=node
+        STATE.lastChar=c
+    end
 end
 
--- Start the heartbeat connection immediately — it checks STATE.antiStompOn internally
-startAntiStomp()
+local function getDefense()
+    local c=getChar()
+    -- Detect respawn without CharacterAdded event
+    if c ~= STATE.lastChar then
+        STATE.defenseNode=nil
+        STATE.lastChar=c
+        resolveDefenseNode()
+        return nil
+    end
+    if not STATE.defenseNode then
+        resolveDefenseNode()
+        return nil
+    end
+    local ok,v=pcall(function() return STATE.defenseNode.Value end)
+    if ok and type(v)=="number" then return v end
+    STATE.defenseNode=nil
+    return nil
+end
+
+-- ================================================================
+-- LOCATIONS
+-- Confirmed from workspace dumps + pastebin scripts cross-reference.
+-- Ignored folder gave us police/jail/kicks.
+-- Pastebin CFrame coords cross-referenced with our map Y values.
+-- Gun stores: no prompts in game, pin manually.
+-- ================================================================
+local ARMOR_LOCS={
+    -- Confirmed from Ignored/PoliceSpawn
+    {name="Police Station",  pos=Vector3.new(-267,23,-73)},
+}
+local GUN_LOCS={
+    -- Pin these manually by walking to each gun store
+}
+
+-- Known teleport locations (confirmed + cross-ref)
+local TP_LOCS={
+    -- From Ignored folder (100% confirmed)
+    {name="Police Station",  cat="misc",  pos=Vector3.new(-267,23,-73)},
+    {name="Hood Kicks",      cat="misc",  pos=Vector3.new(-225,19,-410)},
+    {name="Jail",            cat="misc",  pos=Vector3.new(-294,20,-68)},
+    {name="Turf A",          cat="misc",  pos=Vector3.new(-928,58,-221)},
+    {name="Turf B",          cat="misc",  pos=Vector3.new(46,63,-875)},
+    {name="Turf C (Church)", cat="misc",  pos=Vector3.new(560,88,-575)},
+    -- From Pastebin scripts cross-ref with our Y-level data
+    -- Y~19-22 = ground floor shops. Cross-ref with BountyPoster positions
+    -- to exclude those. Remaining unique positions:
+    {name="Shop: -640,-119", cat="misc",  pos=Vector3.new(-638,19,-119)},
+    {name="Shop: -1040,-257",cat="misc",  pos=Vector3.new(-1040,19,-257)},
+    {name="Shop: -995,-153", cat="misc",  pos=Vector3.new(-995,22,-153)},
+    {name="Shop: -578,-725", cat="misc",  pos=Vector3.new(-578,6,-725)},
+    {name="Shop: 471,-621",  cat="misc",  pos=Vector3.new(471,45,-621)},
+}
+
+local function nearestOf(locs)
+    if not locs or #locs==0 then return nil end
+    local hrp=getHRP()
+    if not hrp then return locs[1] end
+    local myPos=hrp.Position
+    local best,bestD=locs[1],math.huge
+    for _,loc in ipairs(locs) do
+        if loc and loc.pos then
+            local d=dist3(myPos,loc.pos)
+            if d<bestD then bestD=d; best=loc end
+        end
+    end
+    return best
+end
+
+-- ================================================================
+-- AUTO ARMOR
+-- ================================================================
+local armorCD=0
+task.spawn(function()
+    task.wait(2); resolveDefenseNode()
+    while true do
+        task.wait(0.5)
+        if STATE.autoArmorOn and #ARMOR_LOCS>0 then
+            if tick()<armorCD then task.wait(1) end
+            local def=getDefense()
+            if def~=nil and def<=0 then
+                local loc=nearestOf(ARMOR_LOCS)
+                if loc then
+                    notify("getting armor","armor",3)
+                    tp(loc.pos)
+                    task.wait(1.5)
+                    local newDef=getDefense()
+                    if newDef and newDef>0 then
+                        notify("def: "..tostring(math.floor(newDef)),"armor",3)
+                    end
+                    armorCD=tick()+5
+                end
+            end
+        end
+    end
+end)
 
 -- ================================================================
 -- KILL AURA
@@ -327,9 +433,10 @@ task.spawn(function()
                 for _,p in ipairs(Players:GetPlayers()) do
                     if p~=lp and p.Character and getStatus(p)=="ko" then
                         local tpos=getTorsoPos(p)
-                        if tpos and (tpos-myPos).Magnitude<30 then
+                        if tpos then
+                            local d=dist3(myPos,tpos)
                             local cd=auraCDs[p.Name] or 0
-                            if now>=cd then
+                            if d<30 and now>=cd then
                                 auraCDs[p.Name]=now+1.5
                                 task.spawn(function() stomp(tpos) end)
                             end
@@ -366,7 +473,8 @@ task.spawn(function()
                 local real=hrp.Position
                 for i=1,3 do
                     safe(function()
-                        hrp.Position=Vector3.new(real.X+math.random(-500,500),real.Y,real.Z+math.random(-500,500))
+                        hrp.Position=Vector3.new(
+                            real.X+math.random(-500,500),real.Y,real.Z+math.random(-500,500))
                     end)
                     task.wait()
                     safe(function() hrp.Position=real end)
@@ -391,7 +499,7 @@ task.spawn(function()
                     if p~=lp and p.Character and getStatus(p)=="alive" then
                         local pp=getTorsoPos(p)
                         if pp then
-                            local d=(pp-myPos).Magnitude
+                            local d=dist3(myPos,pp)
                             if d<bestD then bestD=d; best=p end
                         end
                     end
@@ -470,18 +578,21 @@ end)
 -- ================================================================
 local CAM=WS.CurrentCamera; local SW=CAM.ViewportSize.X
 local function D(c,d) local o=Drawing.new(c); if d then for k,v in pairs(d) do o[k]=v end end; return o end
-local bg=D("Square",{Filled=true, Color=Color3.fromRGB(8,10,16),   Size=Vector2.new(208,96), Position=Vector2.new(SW-218,10),Visible=true,Corner=6})
-local bd=D("Square",{Filled=false,Color=Color3.fromRGB(210,60,60), Size=Vector2.new(208,96), Position=Vector2.new(SW-218,10),Visible=true,Corner=6,Thickness=2})
+local bg=D("Square",{Filled=true, Color=Color3.fromRGB(8,10,16),   Size=Vector2.new(208,110),Position=Vector2.new(SW-218,10),Visible=true,Corner=6})
+local bd=D("Square",{Filled=false,Color=Color3.fromRGB(210,60,60), Size=Vector2.new(208,110),Position=Vector2.new(SW-218,10),Visible=true,Corner=6,Thickness=2})
 local tx=D("Text",  {Color=Color3.fromRGB(215,215,215),Size=13,Font=Drawing.Fonts.Monospace,Outline=true,Visible=true,Position=Vector2.new(SW-210,18)})
 local function updateHUD()
     local function s(v) return v and "ON" or "off" end
     local tn=STATE.targetName or "none"; if #tn>13 then tn=tn:sub(1,11)..".." end
     local ts=""; if STATE.target then ts=" ["..getStatus(STATE.target).."]" end
+    local def=getDefense()
+    local defStr=def~=nil and tostring(math.floor(def)) or "?"
     tx.Text=string.format(
-        "Da Hood\ntarget: %s%s\norbit:%s stomp:%s\nvoid:%s  aura:%s\nanti:%s  spd:%s",
+        "Da Hood\ntarget: %s%s\norbit:%s stomp:%s\nvoid:%s  aura:%s\nanti:%s  spd:%s\narmor:%s  def:[%s]",
         tn,ts,s(STATE.orbitActive),s(STATE.autoStompOn),
         s(STATE.voidActive),s(STATE.killAuraOn),
-        s(STATE.antiStompOn),s(STATE.speedOn))
+        s(STATE.antiStompOn),s(STATE.speedOn),
+        s(STATE.autoArmorOn),defStr)
 end
 task.spawn(function() while true do task.wait(0.5); pcall(updateHUD) end end)
 
@@ -515,7 +626,7 @@ UI.AddTab("Da Hood", function(tab)
         STATE.target=nil; STATE.targetName=nil; notify("cleared","target",3)
     end)
 
-    -- PLAYER LIST
+    -- PLAYERS
     local pSec=tab:Section("Players","Right")
     for _,p in ipairs(Players:GetPlayers()) do
         if p~=lp then
@@ -561,12 +672,41 @@ UI.AddTab("Da Hood", function(tab)
     -- DEFENSE
     local dSec=tab:Section("Defense","Left")
     dSec:Toggle("t_anti","Anti Stomp  (heartbeat)",false,function(v)
-        STATE.antiStompOn=v
-        notify(v and "anti-stomp ON" or "anti-stomp off","defense",3)
+        STATE.antiStompOn=v; notify(v and "anti-stomp ON" or "off","defense",3)
     end)
     dSec:Toggle("t_fakelag","Fake Lag",false,function(v)
         STATE.fakeLagOn=v; notify(v and "fake lag ON" or "off","lag",3)
     end)
+
+    -- AUTO ARMOR
+    local aSec=tab:Section("Auto Armor","Right")
+    aSec:Toggle("t_autoarmor","Auto Armor (def=0)",false,function(v)
+        STATE.autoArmorOn=v
+        if v then
+            resolveDefenseNode()
+            local def=getDefense()
+            notify("auto armor ON  def="..(def~=nil and tostring(math.floor(def)) or "?"),"armor",3)
+        else notify("auto armor off","armor",3) end
+    end)
+    aSec:Button("Check Defense",function()
+        resolveDefenseNode()
+        local def=getDefense()
+        local s=def~=nil and tostring(math.floor(def)) or "not found"
+        notify("defense = "..s,"armor",4)
+        print("[Armor] defense = "..s)
+    end)
+    aSec:Button("Pin Armor Spawn",function()
+        local hrp=getHRP(); if not hrp then notify("no char","locs",3); return end
+        local pos=hrp.Position
+        local name="Armor "..#ARMOR_LOCS+1
+        table.insert(ARMOR_LOCS,{name=name,pos=pos})
+        notify("pinned: "..name,"locs",3)
+        print(string.format("[Pin:Armor] %s: %.0f, %.0f, %.0f",name,pos.X,pos.Y,pos.Z))
+    end)
+    for _,loc in ipairs(ARMOR_LOCS) do
+        local lpos=loc.pos; local lname=loc.name
+        aSec:Button("TP: "..lname,function() tp(lpos); notify("TP: "..lname,"tp",3) end)
+    end
 
     -- MISC
     local mSec=tab:Section("Misc","Right")
@@ -577,21 +717,31 @@ UI.AddTab("Da Hood", function(tab)
 
     -- TELEPORTS
     local tpSec=tab:Section("Teleports","Left")
-    local TPS={
-        {"Police Station", Vector3.new(-267,23,-73)},
-        {"Hood Kicks",     Vector3.new(-225,19,-410)},
-        {"Sewers (RPG)",   Vector3.new(-264,-1,-318)},
-        {"Jail",           Vector3.new(-294,20,-68)},
-        {"Turf A",         Vector3.new(-928,58,-221)},
-        {"Turf B",         Vector3.new(46,63,-875)},
-    }
-    for _,t in ipairs(TPS) do
-        local name,pos=t[1],t[2]
-        tpSec:Button(name,function()
-            tp(pos); notify("TP: "..name,"tp",3)
-        end)
+    for _,loc in ipairs(TP_LOCS) do
+        local lpos=loc.pos; local lname=loc.name
+        tpSec:Button(lname,function() tp(lpos); notify("TP: "..lname,"tp",3) end)
     end
-    tpSec:Button("Print My Position",function()
+
+    -- GUN SPAWNS
+    local gSec=tab:Section("Gun Spawns","Right")
+    gSec:Text("Walk to gun store, press Pin")
+    gSec:Button("Pin Gun Spawn",function()
+        local hrp=getHRP(); if not hrp then notify("no char","locs",3); return end
+        local pos=hrp.Position
+        local name="Gun "..#GUN_LOCS+1
+        table.insert(GUN_LOCS,{name=name,pos=pos})
+        notify("pinned: "..name,"locs",3)
+        print(string.format("[Pin:Gun] %s: %.0f, %.0f, %.0f",name,pos.X,pos.Y,pos.Z))
+    end)
+    for _,loc in ipairs(GUN_LOCS) do
+        local lpos=loc.pos; local lname=loc.name
+        gSec:Button("TP: "..lname,function() tp(lpos); notify("TP: "..lname,"tp",3) end)
+    end
+    if #GUN_LOCS==0 then gSec:Text("none pinned yet") end
+
+    -- UTILS
+    local uSec=tab:Section("Utils","Left")
+    uSec:Button("Print My Position",function()
         local hrp=getHRP(); if not hrp then return end
         local p=hrp.Position
         local s=string.format("%.0f, %.0f, %.0f",p.X,p.Y,p.Z)
@@ -606,18 +756,19 @@ UI.AddTab("Da Hood", function(tab)
     cSec:Button("Stop All",function()
         stopOrbit(true); stopVoid(false)
         STATE.autoStompOn=false; STATE.killAuraOn=false
-        STATE.voidActive=false; STATE.fakeLagOn=false; STATE.speedOn=false
-        UI.SetValue("t_orbit",false); UI.SetValue("t_void",false)
-        UI.SetValue("t_stomp",false); UI.SetValue("t_aura",false)
-        UI.SetValue("t_fakelag",false); UI.SetValue("t_speed",false)
+        STATE.voidActive=false; STATE.fakeLagOn=false
+        STATE.speedOn=false; STATE.autoArmorOn=false
+        UI.SetValue("t_orbit",false);    UI.SetValue("t_void",false)
+        UI.SetValue("t_stomp",false);    UI.SetValue("t_aura",false)
+        UI.SetValue("t_fakelag",false);  UI.SetValue("t_speed",false)
+        UI.SetValue("t_autoarmor",false)
         notify("all stopped","stop",3)
     end)
 
     -- CREDITS
     local crSec=tab:Section("Credits","Left")
-    crSec:Text("Was_Benji — concept + orbit")
-   
-    crSec:Text("Claude Sonnet 4.6 — code")
+    crSec:Text("debrainers -- orbit, antistomp methods")
+    crSec:Text("Claude")
 
 end)
 
@@ -671,5 +822,5 @@ task.spawn(function()
     for _,g in ipairs(GM.GROUPS) do task.spawn(function() pcall(gmFetch,g,nil) end) end
 end)
 
-print("[DaHood] ready — X=orbit  V=stomp  C=void")
-notify("Da Hood","Was_Benji  + Claude",5)
+print("[DaHood] ready -- X=orbit  V=stomp  C=void")
+notify("Da Hood","Was_Benji on discord ",5)
