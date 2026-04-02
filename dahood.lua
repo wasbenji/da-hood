@@ -13,12 +13,7 @@
     V  = toggle auto stomp
     C  = toggle void
 
-  CONFIRMED FACTS:
-    armor node  = BodyEffects.Defense (NumberValue, 100=full 0=none)
-    CharacterAdded event = nil in Matcha (poll instead)
-    gun stores  = no ProximityPrompts, custom UI only
-    bounty post = 22 prompts in MAP/BountyPosters (not shops)
-    vehicle spw = prompts in VehicleSpawner/Sign (not shops)
+
 ]]
 
 local Players    = game:GetService("Players")
